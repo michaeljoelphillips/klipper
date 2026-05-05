@@ -47,6 +47,8 @@ class ClockSync:
         self.cmd_queue = serial.alloc_command_queue()
         serial.register_response(self._handle_clock, 'clock')
         self.reactor.update_timer(self.get_clock_timer, self.reactor.NOW)
+    def disconnect(self):
+        self.reactor.update_timer(self.get_clock_timer, self.reactor.NEVER)
     def connect_file(self, serial, pace=False):
         self.serial = serial
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')

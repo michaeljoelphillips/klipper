@@ -12,9 +12,10 @@ class error(Exception):
     pass
 
 class SerialReader:
-    def __init__(self, reactor, mcu_name=""):
+    def __init__(self, reactor, mcu_name="", mcu=None):
         self.reactor = reactor
         self.warn_prefix = ""
+        self.mcu = mcu
         self.mcu_name = mcu_name
         if self.mcu_name:
             self.warn_prefix = "mcu '%s': " % (self.mcu_name)
@@ -169,6 +170,8 @@ class SerialReader:
         logging.info("%sStarting connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
         while 1:
+            if self.serialqueue is not None: # if we're already connected, don't recon
+                break
             if self.reactor.monotonic() > start_time + 90.:
                 self._error("Unable to connect")
             try:
@@ -182,6 +185,16 @@ class SerialReader:
             ret = self._start_session(serial_dev)
             if ret:
                 break
+    def check_connect(self, serialport, baud, rts=True):
+        serial_dev = serial.Serial(baudrate=baud, timeout=0, exclusive=False)
+        serial_dev.port = serialport
+        serial_dev.rts = rts
+        try:
+            serial_dev.open()
+        except Exception:
+            return False
+        serial_dev.close()
+        return True
     def connect_uart(self, serialport, baud, rts=True):
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
@@ -247,11 +260,21 @@ class SerialReader:
                 del self.handlers[name, oid]
             else:
                 self.handlers[name, oid] = callback
+    def _check_disconnected(self):
+        if self.mcu is not None and self.mcu.is_disconnected():
+            self._error("MCU is disconnected")
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
-        self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
-                                      cmd, len(cmd), minclock, reqclock, 0)
+        self._check_disconnected()
+        if self.serialqueue is None:
+            return
+        self.ffi_lib.serialqueue_send(
+            self.serialqueue, cmd_queue, cmd, len(cmd), minclock, reqclock, 0
+        )
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
+        self._check_disconnected()
+        if self.serialqueue is None:
+            return
         self.last_notify_id += 1
         nid = self.last_notify_id
         completion = self.reactor.completion()

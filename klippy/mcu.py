@@ -774,7 +774,7 @@ class MCUConnectHelper:
         self._reactor = printer.get_reactor()
         self._name = name = mcu.get_name()
         # Serial port
-        self._serial = serialhdl.SerialReader(self._reactor, mcu_name=name)
+        self._serial = serialhdl.SerialReader(self._reactor, mcu_name=name, mcu=mcu)
         self._baud = 0
         self._canbus_iface = None
         canbus_uuid = config.get('canbus_uuid', None)
@@ -824,7 +824,7 @@ class MCUConnectHelper:
                              "event_type": event_type,
                              "shutdown_clock": shutdown_clock})
     def _handle_starting(self, params):
-        if not self._is_shutdown:
+        if not self._is_shutdown and self._mcu.is_critical():
             self._printer.invoke_async_shutdown("MCU '%s' spontaneous restart"
                                                 % (self._name,))
     def log_info(self):
@@ -870,6 +870,9 @@ class MCUConnectHelper:
         except serialhdl.error as e:
             raise error(str(e))
     def _mcu_identify(self):
+        self._mcu._non_critical_helper._mcu_identify()
+        if self._mcu.is_disconnected():
+            return False
         if self._mcu.is_fileoutput():
             self._attach_file()
         else:
@@ -880,6 +883,7 @@ class MCUConnectHelper:
         self._serial.register_response(self._handle_shutdown, 'shutdown')
         self._serial.register_response(self._handle_shutdown, 'is_shutdown')
         self._serial.register_response(self._handle_starting, 'starting')
+        return True
     def _analyze_shutdown(self, msg, details):
         if self._mcu.is_fileoutput():
             return
@@ -899,6 +903,7 @@ class MCUConnectHelper:
             or self._is_timeout):
             return
         self._is_timeout = True
+        self._mcu._non_critical_helper.disconnect()
         logging.info("Timeout with MCU '%s' (eventtime=%f)",
                      self._name, eventtime)
         self._printer.invoke_shutdown("Lost communication with MCU '%s'" % (
@@ -1002,6 +1007,13 @@ class MCUConfigHelper:
                                        self._mcu_identify)
         printer.register_event_handler("klippy:connect", self._connect)
     def _finalize_config(self):
+        self._mcu._non_critical_helper.cache_config({
+            'oid_count': self._oid_count,
+            'config_cmds': self._config_cmds.copy(),
+            'init_cmds': self._init_cmds.copy(),
+            'restart_cmds': self._restart_cmds.copy(),
+        })
+
         # Build config commands
         for cb in self._config_callbacks:
             cb()
@@ -1142,6 +1154,113 @@ class MCUConfigHelper:
     def request_move_queue_slot(self):
         self._reserved_move_slots += 1
 
+# Manages state of non-critical MCUs
+class MCUNonCriticalHelper:
+    def __init__(self, config, mcu):
+        self._is_non_critical = config.getboolean("is_non_critical", False)
+
+        if self._is_non_critical and mcu.get_name() == "mcu":
+            raise error("Primary MCU cannot be marked as non-critical!")
+        if self._is_non_critical:
+            self.non_critical_recon_timer = mcu.get_printer().get_reactor().register_timer(
+                self._recon_event_handler
+            )
+            if config.get('canbus_uuid', None) is not None:
+                raise error("CAN MCUs can't be non-critical yet!")
+
+        self.disconnected = False
+        self._no_reconnect = config.getboolean("no_reconnect", False)
+        self._mcu = mcu
+        self._cached_config = {}
+        self._gcode = self._mcu._printer.lookup_object("gcode")
+        self._reconnect_interval = (
+            config.getfloat("reconnect_interval", 2.0) + 0.12
+        )
+        self._non_critical_disconnect_event_name = (
+            f"danger:non_critical_mcu_{self._mcu.get_name()}:disconnected"
+        )
+        self._non_critical_reconnect_event_name = (
+            f"danger:non_critical_mcu_{self._mcu.get_name()}:reconnected"
+        )
+
+    def _recon_event_handler(self, eventtime):
+        if self._no_reconnect:
+            return self._mcu.get_printer().get_reactor().NEVER
+
+        reconnected = self._reconnect()
+
+        if reconnected:
+            self._gcode.respond_info(
+                f"mcu: '{self._mcu._name}' reconnected!", log=True
+            )
+            return self._mcu.get_printer().get_reactor().NEVER
+        else:
+            return eventtime + self._reconnect_interval
+
+    def _reconnect(self):
+        res = self._mcu._conn_helper._mcu_identify()
+
+        if not res:
+            return False
+
+        self.disconnected = False
+
+        self._reset()
+        self._mcu.get_printer().send_event(self._non_critical_reconnect_event_name)
+
+        return True
+
+    def _reset(self):
+        if not self._cached_config:
+            return
+
+        self._mcu._config_helper._oid_count = self._cached_config['oid_count']
+        self._mcu._config_helper._config_cmds = self._cached_config['config_cmds']
+        self._mcu._config_helper._init_cmds = self._cached_config['init_cmds']
+        self._mcu._config_helper._restart_cmds = self._cached_config['restart_cmds']
+        self._mcu._config_helper._reserved_move_slots = 0
+        self._mcu._config_helper._connect()
+
+    def _check_serial(self):
+        rts = self._mcu._restart_helper._restart_method != "cheetah"
+        return self._mcu._serial.check_connect(
+            self._mcu._restart_helper._serialport,
+            self._mcu._restart_helper._baud,
+            rts
+        )
+
+    def _mcu_identify(self):
+        if not self.is_critical() and not self._check_serial():
+            self.disconnected = True
+        else:
+            self.disconnected = False
+
+    def cache_config(self, config):
+        if self._cached_config:
+            return
+
+        self._cached_config = config
+
+    def is_critical(self):
+        return not self._is_non_critical
+
+    def disconnect(self):
+        if self.is_critical():
+            return
+
+        self.disconnected = True
+        self._mcu._clocksync.disconnect()
+        self._mcu._restart_helper._disconnect()
+        self._mcu._reactor.update_timer(
+            self.non_critical_recon_timer, self._mcu._reactor.NOW
+        )
+        self._mcu._printer.send_event(self._non_critical_disconnect_event_name)
+        self._gcode.respond_info(f"mcu: '{self._mcu._name}' disconnected!", log=True)
+
+    def get_non_critical_reconnect_event_name(self):
+        return self._non_critical_reconnect_event_name
+
+
 # Main MCU class
 class MCU:
     error = error
@@ -1156,6 +1275,7 @@ class MCU:
         self._serial = self._conn_helper.get_serial()
         self._config_helper = MCUConfigHelper(self, self._conn_helper)
         self._stats_helper = MCUStatsHelper(self, self._conn_helper)
+        self._non_critical_helper = MCUNonCriticalHelper(config, self)
         printer.load_object(config, "error_mcu")
         # Alter time reporting when debugging
         if self.is_fileoutput():
@@ -1235,6 +1355,15 @@ class MCU:
         return self._stats_helper.get_status(eventtime)
     def stats(self, eventtime):
         return self._stats_helper.stats(eventtime)
+    # Non-critical wrappers
+    def is_critical(self):
+        return self._non_critical_helper.is_critical()
+    def is_non_critical(self):
+        return not self._non_critical_helper.is_critical()
+    def is_disconnected(self):
+        return self._non_critical_helper.disconnected
+    def get_non_critical_reconnect_event_name(self):
+        return self._non_critical_helper.get_non_critical_reconnect_event_name()
 
 def add_printer_objects(config):
     printer = config.get_printer()
