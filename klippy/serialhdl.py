@@ -261,7 +261,7 @@ class SerialReader:
             else:
                 self.handlers[name, oid] = callback
     def _check_disconnected(self):
-        if self.mcu is not None and self.mcu.is_disconnected():
+        if self.mcu is not None and self.mcu.is_critical() and self.mcu.is_disconnected():
             self._error("MCU is disconnected")
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):

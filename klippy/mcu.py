@@ -752,7 +752,7 @@ class MCURestartHelper:
         self._reactor.pause(self._reactor.monotonic() + 2.)
         chelper.run_hub_ctrl(1)
     def _firmware_restart(self, force=False):
-        if self._is_mcu_bridge and not force:
+        if (self._is_mcu_bridge and not force) or self._mcu.is_disconnected():
             return
         if self._restart_method == 'rpi_usb':
             self._restart_rpi_usb()
@@ -902,6 +902,9 @@ class MCUConnectHelper:
         if (self._clocksync.is_active() or self._mcu.is_fileoutput()
             or self._is_timeout):
             return
+        if self._mcu.is_non_critical():
+            self._mcu.disconnect_if_non_critical()
+            return
         self._is_timeout = True
         self._mcu._non_critical_helper.disconnect()
         logging.info("Timeout with MCU '%s' (eventtime=%f)",
@@ -951,6 +954,8 @@ class MCUStatsHelper:
         self._get_status_info['mcu_version'] = version
         self._get_status_info['mcu_build_versions'] = build_versions
         self._get_status_info['mcu_constants'] = msgparser.get_constants()
+        self._get_status_info['is_connected'] = True
+        self._get_status_info['non_critical_disconnected'] = True
         self._serial.register_response(self._handle_mcu_stats, 'stats')
     def _ready(self):
         if self._mcu.is_fileoutput():
@@ -1154,8 +1159,13 @@ class MCUConfigHelper:
     def request_move_queue_slot(self):
         self._reserved_move_slots += 1
 
-# Manages state of non-critical MCUs
 class MCUNonCriticalHelper:
+    """
+    A helper for non-critical MCU logic.
+
+    Non-critical MCUs may be disconnected and reconnected without raising a
+    fatal error with Klipper.
+    """
     def __init__(self, config, mcu):
         self._is_non_critical = config.getboolean("is_non_critical", False)
 
@@ -1184,6 +1194,14 @@ class MCUNonCriticalHelper:
         )
 
     def _recon_event_handler(self, eventtime):
+        """
+        The reconnect event handler.
+
+        Attempt to reconnect the MCU on a reactor timer.
+
+        If `no_reconnect` is `True` in the MCU configuration, the MCU will not
+        be reconnected.
+        """
         if self._no_reconnect:
             return self._mcu.get_printer().get_reactor().NEVER
 
@@ -1203,10 +1221,9 @@ class MCUNonCriticalHelper:
         if not res:
             return False
 
-        self.disconnected = False
-
         self._reset()
         self._mcu.get_printer().send_event(self._non_critical_reconnect_event_name)
+        self._mcu._stats_helper._get_status_info['is_connected'] = True
 
         return True
 
@@ -1214,6 +1231,7 @@ class MCUNonCriticalHelper:
         if not self._cached_config:
             return
 
+        self._mcu._config_helper._config_finalized = False
         self._mcu._config_helper._oid_count = self._cached_config['oid_count']
         self._mcu._config_helper._config_cmds = self._cached_config['config_cmds']
         self._mcu._config_helper._init_cmds = self._cached_config['init_cmds']
@@ -1222,40 +1240,66 @@ class MCUNonCriticalHelper:
         self._mcu._config_helper._connect()
 
     def _check_serial(self):
-        rts = self._mcu._restart_helper._restart_method != "cheetah"
+        rts = self._mcu._conn_helper._restart_helper._restart_method != "cheetah"
+        serialport, baud = self._mcu._conn_helper.get_serialport()
         return self._mcu._serial.check_connect(
-            self._mcu._restart_helper._serialport,
-            self._mcu._restart_helper._baud,
+            serialport,
+            baud,
             rts
         )
 
     def _mcu_identify(self):
+        """
+        Check the connection of the MCU.
+
+        Runs inline with the `MCUConnectHelper._mcu_identify` routine.
+        """
         if not self.is_critical() and not self._check_serial():
             self.disconnected = True
         else:
             self.disconnected = False
 
     def cache_config(self, config):
+        """
+        Cache the state of the MCU configuration.
+
+        The cached configuration value is later used to restore the original
+        configuration for the MCU during a reconnect.
+        """
         if self._cached_config:
             return
 
         self._cached_config = config
 
     def is_critical(self):
+        """
+        Determine if the MCU is critical to the function of the printer.
+
+        If `False`, the MCU can be disconnected and the printer may be able to
+        operate in a limited capacity.
+        """
         return not self._is_non_critical
 
     def disconnect(self):
-        if self.is_critical():
+        """
+        Disconnect the MCU.
+
+        May be called as a result of a serial connection timeout.
+        """
+        if self.is_critical() or self.disconnected:
             return
 
         self.disconnected = True
         self._mcu._clocksync.disconnect()
-        self._mcu._restart_helper._disconnect()
-        self._mcu._reactor.update_timer(
-            self.non_critical_recon_timer, self._mcu._reactor.NOW
+        self._mcu._conn_helper._restart_helper._disconnect()
+        self._mcu.get_printer().get_reactor().update_timer(
+            self.non_critical_recon_timer,
+            self._mcu.get_printer().get_reactor().NOW
         )
         self._mcu._printer.send_event(self._non_critical_disconnect_event_name)
         self._gcode.respond_info(f"mcu: '{self._mcu._name}' disconnected!", log=True)
+        self._mcu._stats_helper._get_status_info['is_connected'] = False
+        self._mcu._stats_helper._get_status_info['non_critical_disconnected'] = True
 
     def get_non_critical_reconnect_event_name(self):
         return self._non_critical_reconnect_event_name
@@ -1364,6 +1408,9 @@ class MCU:
         return self._non_critical_helper.disconnected
     def get_non_critical_reconnect_event_name(self):
         return self._non_critical_helper.get_non_critical_reconnect_event_name()
+    def disconnect_if_non_critical(self):
+        if self.is_non_critical():
+            self._non_critical_helper.disconnect()
 
 def add_printer_objects(config):
     printer = config.get_printer()
